@@ -84,14 +84,16 @@ function ticketForChannel(channelId) {
 function ticketEmbed(ticket) {
   return new EmbedBuilder()
     .setColor(ticket.status === 'open' ? colors.brand : colors.danger)
-    .setTitle(`Ticket #${ticket.number}`)
-    .setDescription(ticket.description || 'No description provided.')
+    .setTitle(`${ticket.status === 'open' ? 'Support ticket' : 'Closed ticket'} #${ticket.number}`)
+    .setDescription(`**${ticket.subject || 'Support request'}**\n\n${ticket.description || 'No description provided.'}`)
     .addFields(
       { name: 'Owner', value: `<@${ticket.ownerId}>`, inline: true },
-      { name: 'Status', value: ticket.status, inline: true },
+      { name: 'Status', value: ticket.status === 'open' ? '🟢 Open' : '🔴 Closed', inline: true },
       { name: 'Claimed by', value: ticket.claimedBy ? `<@${ticket.claimedBy}>` : 'Unclaimed', inline: true },
+      ...(ticket.reference ? [{ name: 'Reference', value: ticket.reference, inline: true }] : []),
     )
-    .setFooter({ text: 'Use the buttons below to manage this ticket.' });
+    .setTimestamp(new Date(ticket.createdAt))
+    .setFooter({ text: 'Support Center • Please keep all relevant details in this ticket.' });
 }
 
 function ticketButtons(ticket) {
@@ -105,8 +107,21 @@ function ticketButtons(ticket) {
 
 function panelComponents() {
   return [new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('ticket:create').setLabel('Create a ticket').setEmoji('🎫').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('ticket:create').setLabel('Open a support ticket').setEmoji('🎫').setStyle(ButtonStyle.Primary),
   )];
+}
+
+function panelEmbed() {
+  return new EmbedBuilder()
+    .setColor(colors.brand)
+    .setTitle('Support Center')
+    .setDescription('Need help? Open a private ticket and our support team will get back to you.')
+    .addFields(
+      { name: 'Before opening a ticket', value: 'Please check that you do not already have an open ticket and gather any order IDs, screenshots, or error messages.' },
+      { name: 'What should I write?', value: 'Tell us what happened, when it happened, what you expected, and what you have already tried. More detail helps us resolve your request faster.' },
+      { name: 'Privacy', value: 'Only you and the support team will be able to see your ticket.' },
+    )
+    .setFooter({ text: 'Click the button below to contact support.' });
 }
 
 function setupCommand() {
@@ -198,7 +213,8 @@ async function closeTicket(interaction, ticket, reason) {
   saveStore();
   await interaction.channel.permissionOverwrites.edit(ticket.ownerId, { SendMessages: false, ViewChannel: true });
   await interaction.channel.setName(`closed-${ticket.number}`).catch(() => null);
-  return interaction.reply({ embeds: [new EmbedBuilder().setColor(colors.danger).setTitle('Ticket closed').setDescription(`Closed by ${interaction.user}.\nReason: ${ticket.closeReason}`)], components: ticketButtons(ticket) });
+  const response = { embeds: [new EmbedBuilder().setColor(colors.danger).setTitle('Ticket closed').setDescription(`Closed by ${interaction.user}.\nReason: ${ticket.closeReason}`)], components: ticketButtons(ticket) };
+  return interaction.deferred ? interaction.editReply(response) : interaction.reply(response);
 }
 
 client.once(Events.ClientReady, async (readyClient) => {
@@ -225,9 +241,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const existing = Object.values(store.tickets).find((ticket) => ticket.guildId === interaction.guildId && ticket.ownerId === interaction.user.id && ticket.status === 'open');
       if (existing) return interaction.reply({ content: `You already have an open ticket: <#${existing.channelId}>`, ephemeral: true });
       const modal = new ModalBuilder().setCustomId('ticket:create-modal').setTitle('Open a support ticket');
-      const subject = new TextInputBuilder().setCustomId('subject').setLabel('Subject').setStyle(TextInputStyle.Short).setMaxLength(80).setRequired(true);
-      const description = new TextInputBuilder().setCustomId('description').setLabel('How can we help?').setStyle(TextInputStyle.Paragraph).setMaxLength(2000).setRequired(true);
-      return interaction.showModal(modal.addComponents(new ActionRowBuilder().addComponents(subject), new ActionRowBuilder().addComponents(description)));
+      const subject = new TextInputBuilder().setCustomId('subject').setLabel('What do you need help with?').setPlaceholder('Example: Payment failed on my order').setStyle(TextInputStyle.Short).setMaxLength(80).setRequired(true);
+      const description = new TextInputBuilder().setCustomId('description').setLabel('Explain the issue').setPlaceholder('What happened, when did it happen, and what have you tried?').setStyle(TextInputStyle.Paragraph).setMaxLength(2000).setRequired(true);
+      const reference = new TextInputBuilder().setCustomId('reference').setLabel('Order ID or useful reference (optional)').setPlaceholder('Leave blank if this does not apply').setStyle(TextInputStyle.Short).setMaxLength(100).setRequired(false);
+      return interaction.showModal(modal.addComponents(new ActionRowBuilder().addComponents(subject), new ActionRowBuilder().addComponents(description), new ActionRowBuilder().addComponents(reference)));
     }
 
     if (interaction.isModalSubmit() && interaction.customId === 'ticket:create-modal') {
@@ -241,11 +258,52 @@ client.on(Events.InteractionCreate, async (interaction) => {
         { id: interaction.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] },
         { id: config.supportRoleId, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.ManageMessages] },
       ] });
-      const ticket = { id: ticketId, guildId: interaction.guildId, channelId: channel.id, ownerId: interaction.user.id, number, subject: interaction.fields.getTextInputValue('subject'), description: interaction.fields.getTextInputValue('description'), status: 'open', claimedBy: null, createdAt: new Date().toISOString() };
+      const ticket = { id: ticketId, guildId: interaction.guildId, channelId: channel.id, ownerId: interaction.user.id, number, subject: interaction.fields.getTextInputValue('subject'), description: interaction.fields.getTextInputValue('description'), reference: interaction.fields.getTextInputValue('reference') || null, status: 'open', claimedBy: null, createdAt: new Date().toISOString() };
       store.tickets[ticketId] = ticket;
       saveStore();
       await channel.send({ content: `<@${interaction.user.id}> <@&${config.supportRoleId}>`, embeds: [ticketEmbed(ticket)], components: ticketButtons(ticket) });
       return interaction.editReply(`Your ticket is ready: ${channel}`);
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('ticket:')) {
+      const ticket = ticketForChannel(interaction.channelId);
+      if (!ticket) return interaction.reply({ content: 'This button is no longer connected to an active ticket.', ephemeral: true });
+      if (interaction.customId === 'ticket:close') {
+        if (!isStaff(interaction) && interaction.user.id !== ticket.ownerId) return interaction.reply({ content: 'Only the ticket owner or staff can close this ticket.', ephemeral: true });
+        await interaction.deferReply();
+        return closeTicket(interaction, ticket, 'Closed from the ticket panel');
+      }
+      if (interaction.customId === 'ticket:claim') {
+        if (!isStaff(interaction)) return interaction.reply({ content: 'Only support staff can claim tickets.', ephemeral: true });
+        await interaction.deferReply();
+        ticket.claimedBy = ticket.claimedBy === interaction.user.id ? null : interaction.user.id;
+        saveStore();
+        return interaction.editReply({ content: ticket.claimedBy ? `Ticket claimed by ${interaction.user}.` : 'Ticket is now unclaimed.', components: ticketButtons(ticket) });
+      }
+      if (interaction.customId === 'ticket:transcript') {
+        if (!isStaff(interaction)) return interaction.reply({ content: 'Only support staff can generate transcripts.', ephemeral: true });
+        await interaction.deferReply({ ephemeral: true });
+        const filePath = await sendTranscript(interaction.channel, ticket, interaction);
+        return interaction.editReply({ content: 'Transcript generated successfully.', files: [new AttachmentBuilder(filePath)] });
+      }
+      if (interaction.customId === 'ticket:delete') {
+        if (!isStaff(interaction) && interaction.user.id !== ticket.ownerId) return interaction.reply({ content: 'Only the ticket owner or staff can delete this ticket.', ephemeral: true });
+        await interaction.deferReply();
+        delete store.tickets[ticket.id];
+        saveStore();
+        await interaction.editReply('Deleting this ticket...');
+        return interaction.channel.delete();
+      }
+      if (interaction.customId === 'ticket:reopen') {
+        if (!isStaff(interaction)) return interaction.reply({ content: 'Only support staff can reopen tickets.', ephemeral: true });
+        await interaction.deferReply();
+        ticket.status = 'open';
+        ticket.closedAt = null;
+        saveStore();
+        await interaction.channel.permissionOverwrites.edit(ticket.ownerId, { SendMessages: true, ViewChannel: true });
+        await interaction.channel.setName(`ticket-${ticket.number}`).catch(() => null);
+        return interaction.editReply({ embeds: [new EmbedBuilder().setColor(colors.success).setTitle('Ticket reopened').setDescription(`Reopened by ${interaction.user}.`)], components: ticketButtons(ticket) });
+      }
     }
 
     if (!interaction.isChatInputCommand()) return;
@@ -257,8 +315,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       config.transcriptChannelId = interaction.options.getChannel('transcript_channel')?.id || null;
       config.panelChannelId = interaction.options.getChannel('panel_channel').id;
       saveStore();
-      const panel = new EmbedBuilder().setColor(colors.brand).setTitle('Need help? Open a ticket').setDescription('Press the button below and tell the support team what you need. Your ticket is private.');
-      await interaction.options.getChannel('panel_channel').send({ embeds: [panel], components: panelComponents() });
+      await interaction.options.getChannel('panel_channel').send({ embeds: [panelEmbed()], components: panelComponents() });
       return interaction.reply({ content: 'Ticket system configured and panel posted.', ephemeral: true });
     }
     if (name === 'ticket-config') {

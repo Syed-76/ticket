@@ -5,6 +5,8 @@ A production-minded Discord ticket bot built with Node.js and discord.js v14.
 ## Included features
 
 - Button-based ticket panel with modal intake form
+- Professional support panel with ticket-writing guidance
+- Working panel buttons for claim, close, reopen, transcript, and delete
 - One open ticket per member
 - Persistent ticket state in `data/store.json`
 - Configurable support role, category, and transcript channel
@@ -16,6 +18,7 @@ A production-minded Discord ticket bot built with Node.js and discord.js v14.
 - Staff-only controls with owner access to normal ticket actions
 - Blacklist and unblacklist members
 - Automatic ticket numbering
+- Optional order ID or reference field on every ticket
 
 ## Setup
 
