@@ -226,6 +226,14 @@ client.once(Events.ClientReady, async (readyClient) => {
   }
 });
 
+client.on(Events.Error, (error) => {
+  console.error('Discord client error:', error);
+});
+
+client.on(Events.Warn, (warning) => {
+  console.warn('Discord warning:', warning);
+});
+
 client.on(Events.MessageCreate, async (message) => {
   if (message.author.bot || !message.guild) return;
   const content = message.content.trim();
@@ -354,9 +362,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (name === 'ticket-delete') { if (!isStaff(interaction) && interaction.user.id !== ticket.ownerId) return interaction.reply({ content: 'Only the ticket owner or staff can delete this ticket.', ephemeral: true }); await interaction.reply('Deleting this ticket...'); delete store.tickets[ticket.id]; saveStore(); return interaction.channel.delete(); }
   } catch (error) {
     console.error(error);
+    if (error?.code === 10062 || error?.code === 40060) return;
     const response = { content: 'Something went wrong while handling that request.', ephemeral: true };
     if (interaction.deferred || interaction.replied) await interaction.followUp(response).catch(() => null); else await interaction.reply(response).catch(() => null);
   }
+});
+
+process.on('unhandledRejection', (error) => {
+  console.error('Unhandled promise rejection:', error);
 });
 
 client.login(process.env.DISCORD_TOKEN);

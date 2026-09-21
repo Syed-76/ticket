@@ -6,6 +6,9 @@
   "type": "commonjs",
   "scripts": {
     "start": "node src/index.js",
+    "start:managed": "pm2 start ecosystem.config.cjs",
+    "stop:managed": "pm2 stop ticket-bot",
+    "logs:managed": "pm2 logs ticket-bot",
     "dev": "node --watch src/index.js"
   },
   "engines": {
