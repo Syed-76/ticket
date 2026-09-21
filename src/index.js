@@ -11,6 +11,7 @@ const {
   Client,
   EmbedBuilder,
   Events,
+  GatewayIntentBits,
   ModalBuilder,
   PermissionFlagsBits,
   PermissionsBitField,
@@ -54,7 +55,10 @@ function saveStore() {
 }
 
 const colors = { brand: 0x2f80ed, success: 0x27ae60, danger: 0xeb5757, neutral: 0x5865f2 };
-const client = new Client({ intents: [] });
+const prefix = process.env.PREFIX || '!';
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
+});
 
 function guildConfig(guildId) {
   if (!store.guilds[guildId]) {
@@ -112,8 +116,8 @@ function setupCommand() {
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addChannelOption((o) => o.setName('category').setDescription('Category where tickets are created').addChannelTypes(ChannelType.GuildCategory).setRequired(true))
     .addRoleOption((o) => o.setName('support_role').setDescription('Role that can see and manage tickets').setRequired(true))
-    .addChannelOption((o) => o.setName('transcript_channel').setDescription('Channel for transcript files').addChannelTypes(ChannelType.GuildText).setRequired(false))
-    .addChannelOption((o) => o.setName('panel_channel').setDescription('Channel where the panel should be posted').addChannelTypes(ChannelType.GuildText).setRequired(true));
+    .addChannelOption((o) => o.setName('panel_channel').setDescription('Channel where the panel should be posted').addChannelTypes(ChannelType.GuildText).setRequired(true))
+    .addChannelOption((o) => o.setName('transcript_channel').setDescription('Channel for transcript files').addChannelTypes(ChannelType.GuildText).setRequired(false));
 }
 
 const commands = [
@@ -134,8 +138,25 @@ const commands = [
 
 async function registerCommands() {
   if (!process.env.CLIENT_ID || !process.env.GUILD_ID) throw new Error('Set CLIENT_ID and GUILD_ID in .env');
+  if (!/^\d{17,20}$/.test(process.env.CLIENT_ID) || !/^\d{17,20}$/.test(process.env.GUILD_ID)) {
+    throw new Error('CLIENT_ID and GUILD_ID must be Discord Snowflake IDs. Replace the placeholders in .env.');
+  }
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
   await rest.put(Routes.applicationGuildCommands(process.env.CLIENT_ID, process.env.GUILD_ID), { body: commands });
+  console.log(`Registered ${commands.length} slash commands in guild ${process.env.GUILD_ID}.`);
+}
+
+function helpEmbed() {
+  return new EmbedBuilder()
+    .setColor(colors.brand)
+    .setTitle('Ticket Bot Help')
+    .setDescription(`Use slash commands with "/" or the prefix command \`${prefix}help\`.`)
+    .addFields(
+      { name: 'Getting started', value: '`/ticket-setup` configures the category, support role, transcript channel, and panel.' },
+      { name: 'Ticket controls', value: '`/ticket-close` `/ticket-reopen` `/ticket-claim` `/ticket-unclaim` `/ticket-transcript` `/ticket-rename` `/ticket-add` `/ticket-remove` `/ticket-delete`' },
+      { name: 'Server administration', value: '`/ticket-config` `/ticket-blacklist` `/ticket-unblacklist`' },
+    )
+    .setFooter({ text: `Prefix: ${prefix} | Slash commands are registered to this server.` });
 }
 
 async function sendTranscript(channel, ticket, interaction) {
@@ -181,8 +202,19 @@ async function closeTicket(interaction, ticket, reason) {
 }
 
 client.once(Events.ClientReady, async (readyClient) => {
-  await registerCommands();
-  console.log(`Logged in as ${readyClient.user.tag}`);
+  try {
+    await registerCommands();
+    console.log(`Logged in as ${readyClient.user.tag}`);
+  } catch (error) {
+    console.error('Could not register slash commands:', error.message);
+  }
+});
+
+client.on(Events.MessageCreate, async (message) => {
+  if (message.author.bot || !message.guild) return;
+  const content = message.content.trim();
+  if (content.toLowerCase() !== `${prefix}help`.toLowerCase()) return;
+  await message.reply({ embeds: [helpEmbed()] });
 });
 
 client.on(Events.InteractionCreate, async (interaction) => {

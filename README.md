@@ -21,11 +21,13 @@ A production-minded Discord ticket bot built with Node.js and discord.js v14.
 
 1. Install Node.js 20 or newer.
 2. Create a Discord application and bot in the Discord Developer Portal.
-3. Enable the `Server Members Intent` if you want member management features.
+3. Enable the `Message Content Intent` for the `!help` prefix command. Enable the `Server Members Intent` if you want member management features.
 4. Invite the bot with the `bot` and `applications.commands` scopes and these permissions: Manage Channels, Manage Messages, View Channels, Send Messages, Embed Links, Attach Files, Read Message History, and Use Slash Commands.
 5. Copy `.env.example` to `.env` and fill in `DISCORD_TOKEN`, `CLIENT_ID`, and `GUILD_ID`.
 6. Run `npm install`, then `npm start`.
 7. Run `/ticket-setup` in your server to configure the category, support role, transcript channel, and post the panel.
+
+The prefix help command is `!help` by default. Change `PREFIX` in `.env` to use a different prefix.
 
 ## Commands
 
