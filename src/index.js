@@ -73,6 +73,7 @@ const departments = {
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildPresences, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
 });
+const activeTicketActions = new Set();
 
 function guildConfig(guildId) {
   if (!store.guilds[guildId]) {
@@ -172,19 +173,14 @@ async function logEvent(guild, event, ticket, details = '', actorId = null) {
 }
 
 function ticketEmbed(ticket) {
-  const type = ticketType(ticket);
   return new EmbedBuilder()
     .setColor(ticket.status === 'open' ? colors.brand : colors.danger)
-    .setTitle(`${type.emoji} ${type.label} #${ticket.number}`)
-    .setDescription(`**${ticket.subject || 'Support request'}**\n\n${ticket.description || 'No description provided.'}`)
+    .setTitle('🎫 Ticket Opened')
+    .setDescription('A member of the support team will be with you shortly.')
     .addFields(
-      { name: 'Owner', value: `<@${ticket.ownerId}>`, inline: true },
-      { name: 'Status', value: ticket.status === 'open' ? '🟢 Open' : '🔴 Closed', inline: true },
-      { name: 'Claimed by', value: ticket.claimedBy ? `<@${ticket.claimedBy}>` : 'Unclaimed', inline: true },
-      ...(ticket.reference ? [{ name: 'Reference', value: ticket.reference, inline: true }] : []),
-    )
-    .setTimestamp(new Date(ticket.createdAt))
-    .setFooter({ text: ticket.claimedBy ? `Support Center • Claimed by ${ticket.claimedByName || `<@${ticket.claimedBy}>`}` : 'Support Center • Unclaimed ticket' });
+      { name: 'User', value: `<@${ticket.ownerId}>`, inline: true },
+      { name: 'Status', value: ticket.claimedBy ? `Claimed by ${ticket.claimedByName || `<@${ticket.claimedBy}>`}` : 'Awaiting Staff', inline: true },
+    );
 }
 
 function ticketButtons(ticket) {
@@ -193,6 +189,7 @@ function ticketButtons(ticket) {
     new ButtonBuilder().setCustomId('ticket:claim').setLabel(ticket.claimedBy ? '📌 Unclaim Ticket' : '📌 Claim Ticket').setStyle(ticket.claimedBy ? ButtonStyle.Success : ButtonStyle.Primary),
     new ButtonBuilder().setCustomId('ticket:add-member').setLabel('👤 Add Member').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId('ticket:logs').setLabel('📊 View Logs').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('ticket:delete').setLabel('⛔ Delete Ticket').setStyle(ButtonStyle.Danger),
   )];
 }
 
@@ -420,6 +417,28 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return interaction.editReply(`${member} was added to this ticket.`);
     }
 
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('ticket:delete-confirm:')) {
+      await interaction.deferReply({ ephemeral: true });
+      const ticket = ticketForChannel(interaction.channelId);
+      if (!ticket || !isStaff(interaction)) return interaction.editReply('Only authorized staff can delete this ticket.');
+      if (interaction.fields.getTextInputValue('confirmation').trim().toUpperCase() !== 'DELETE') return interaction.editReply('Deletion cancelled. Type DELETE exactly to confirm.');
+      const actionKey = `${ticket.id}:delete`;
+      if (activeTicketActions.has(actionKey)) return interaction.editReply('Deletion is already in progress.');
+      activeTicketActions.add(actionKey);
+      try {
+        ticket.transcriptPath = await sendTranscript(interaction.channel, ticket, interaction).catch(() => null);
+        ticket.status = 'deleted';
+        ticket.closedAt = new Date().toISOString();
+        await recordTicket(ticket);
+        await logEvent(interaction.guild, 'TICKET_DELETED', ticket, `Deleted by ${interaction.user.tag}`, interaction.user.id);
+        await interaction.editReply('Ticket deleted.');
+        await interaction.channel.delete();
+      } finally {
+        activeTicketActions.delete(actionKey);
+      }
+      return;
+    }
+
     if (interaction.isButton() && interaction.customId.startsWith('ticket:')) {
       const ticket = ticketForChannel(interaction.channelId);
       if (!ticket) return interaction.reply({ content: 'This button is no longer connected to an active ticket.', ephemeral: true });
@@ -430,12 +449,20 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       if (interaction.customId === 'ticket:claim') {
         if (!isStaff(interaction)) return interaction.reply({ content: 'Only support staff can claim tickets.', ephemeral: true });
+        const actionKey = `${ticket.id}:claim`;
+        if (activeTicketActions.has(actionKey)) return interaction.deferUpdate();
+        if (ticket.claimedBy && ticket.claimedBy !== interaction.user.id) return interaction.deferUpdate();
+        activeTicketActions.add(actionKey);
         ticket.claimedBy = ticket.claimedBy === interaction.user.id ? null : interaction.user.id;
         ticket.claimedByName = ticket.claimedBy ? interaction.user.tag : null;
         saveStore();
-        await interaction.update({ embeds: [ticketEmbed(ticket)], components: ticketButtons(ticket) });
-        await recordTicket(ticket);
-        await logEvent(interaction.guild, ticket.claimedBy ? 'TICKET_CLAIMED' : 'TICKET_UNCLAIMED', ticket, ticket.claimedBy ? `Claimed by ${interaction.user.tag}` : `Unclaimed by ${interaction.user.tag}`, interaction.user.id);
+        try {
+          await interaction.update({ embeds: [ticketEmbed(ticket)], components: ticketButtons(ticket) });
+          await recordTicket(ticket);
+          await logEvent(interaction.guild, ticket.claimedBy ? 'TICKET_CLAIMED' : 'TICKET_UNCLAIMED', ticket, ticket.claimedBy ? `Claimed by ${interaction.user.tag}` : `Unclaimed by ${interaction.user.tag}`, interaction.user.id);
+        } finally {
+          activeTicketActions.delete(actionKey);
+        }
         return;
       }
       if (interaction.customId === 'ticket:add-member') {
@@ -458,16 +485,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return interaction.editReply({ content: 'Transcript generated successfully.', files: [new AttachmentBuilder(filePath)] });
       }
       if (interaction.customId === 'ticket:delete') {
-        if (!isStaff(interaction) && interaction.user.id !== ticket.ownerId) return interaction.reply({ content: 'Only the ticket owner or staff can delete this ticket.', ephemeral: true });
-        await interaction.deferReply();
-        delete store.tickets[ticket.id];
-        saveStore();
-        ticket.transcriptPath = await sendTranscript(interaction.channel, ticket, interaction).catch(() => null);
-        ticket.status = 'deleted';
-        ticket.closedAt = new Date().toISOString();
-        await recordTicket(ticket);
-        await interaction.editReply('Deleting this ticket...');
-        return interaction.channel.delete();
+        if (!isStaff(interaction)) return interaction.reply({ content: 'Only authorized staff can delete this ticket.', ephemeral: true });
+        const modal = new ModalBuilder().setCustomId(`ticket:delete-confirm:${ticket.id}`).setTitle('Confirm ticket deletion');
+        const confirmation = new TextInputBuilder().setCustomId('confirmation').setLabel('Type DELETE to confirm').setPlaceholder('DELETE').setStyle(TextInputStyle.Short).setMaxLength(6).setRequired(true);
+        return interaction.showModal(modal.addComponents(new ActionRowBuilder().addComponents(confirmation)));
       }
       if (interaction.customId === 'ticket:reopen') {
         if (!isStaff(interaction)) return interaction.reply({ content: 'Only support staff can reopen tickets.', ephemeral: true });
