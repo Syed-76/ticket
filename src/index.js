@@ -63,6 +63,8 @@ function saveStore() {
 
 const colors = { brand: 0x2f80ed, success: 0x27ae60, danger: 0xeb5757, neutral: 0x5865f2, warning: 0xf2c94c };
 const prefix = process.env.PREFIX || '!';
+const dailyTicketLimit = Math.max(1, Number(process.env.TICKET_DAILY_LIMIT || 3));
+const ticketCooldownMinutes = Math.max(0, Number(process.env.TICKET_COOLDOWN_MINUTES || 30));
 const departments = {
   general_support: { label: 'General Support', emoji: '🎫', prefix: 'support', categoryEnv: 'TICKET_SUPPORT_CATEGORY_ID', roleEnv: 'TICKET_SUPPORT_ROLE_ID', fallbackCategory: 'categoryId', fallbackRole: 'supportRoleId' },
   member_report: { label: 'Player/Member Report', emoji: '🛡️', prefix: 'report', categoryEnv: 'TICKET_REPORT_CATEGORY_ID', roleEnv: 'TICKET_REPORT_ROLE_ID', fallbackCategory: 'categoryId', fallbackRole: 'supportRoleId' },
@@ -126,9 +128,9 @@ function canCreateTicket(guildId, userId) {
   const now = Date.now();
   const attempts = (store.ticketAttempts[key] || []).filter((timestamp) => now - timestamp < 24 * 60 * 60 * 1000);
   store.ticketAttempts[key] = attempts;
-  if (attempts.length >= 3) return 'You have reached the limit of 3 ticket creations in 24 hours.';
+  if (attempts.length >= dailyTicketLimit) return `You have reached the limit of ${dailyTicketLimit} ticket creations in 24 hours.`;
   const lastAttempt = attempts.at(-1);
-  if (lastAttempt && now - lastAttempt < 30 * 60 * 1000) return `Please wait ${Math.ceil((30 * 60 * 1000 - (now - lastAttempt)) / 60000)} minutes before opening another ticket.`;
+  if (ticketCooldownMinutes > 0 && lastAttempt && now - lastAttempt < ticketCooldownMinutes * 60 * 1000) return `Please wait ${Math.ceil((ticketCooldownMinutes * 60 * 1000 - (now - lastAttempt)) / 60000)} minutes before opening another ticket.`;
   return null;
 }
 
