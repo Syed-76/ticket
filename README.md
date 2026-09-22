@@ -57,6 +57,7 @@ The prefix help command is `!help` by default. Change `PREFIX` in `.env` to use 
 ## Commands
 
 - `/ticket-setup category support_role transcript_channel panel_channel`
+- `/prefix symbol` (Manage Server only; example: `/prefix $`)
 - `/ticket-config`
 - `/ticket-blacklist user reason`
 - `/ticket-unblacklist user`
@@ -90,6 +91,8 @@ The dashboard sync contract is `POST DASHBOARD_WEBHOOK_URL` with `Authorization:
 ```
 
 The bot stores configuration and ticket metadata in `data/store.json`. Transcript HTML files are written to `transcripts/`.
+
+Each server can use its own prefix. Run `/prefix $` and the bot will respond to `$help` immediately; the setting survives restarts.
 
 ## Enterprise deployment
 

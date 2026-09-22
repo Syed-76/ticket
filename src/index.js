@@ -81,11 +81,16 @@ function guildConfig(guildId) {
       categoryId: process.env.TICKET_CATEGORY_ID || null,
       transcriptChannelId: process.env.TRANSCRIPT_CHANNEL_ID || null,
       panelChannelId: null,
+      prefix: process.env.PREFIX || '!',
       departments: {},
     };
   }
   store.guilds[guildId].departments ??= {};
   return store.guilds[guildId];
+}
+
+function guildPrefix(guildId) {
+  return guildConfig(guildId).prefix || process.env.PREFIX || '!';
 }
 
 function departmentConfig(guildId, departmentId) {
@@ -224,6 +229,7 @@ function setupCommand() {
 
 const commands = [
   setupCommand(),
+  new SlashCommandBuilder().setName('prefix').setDescription('Change the bot prefix for this server.').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild).addStringOption((o) => o.setName('symbol').setDescription('One to three characters, for example $').setMinLength(1).setMaxLength(3).setRequired(true)),
   new SlashCommandBuilder().setName('ticket-config').setDescription('Show the current ticket configuration.'),
   new SlashCommandBuilder().setName('ticket-close').setDescription('Close the current ticket.').addStringOption((o) => o.setName('reason').setDescription('Why it is being closed').setRequired(false)),
   new SlashCommandBuilder().setName('ticket-reopen').setDescription('Reopen the current ticket.'),
@@ -248,17 +254,18 @@ async function registerCommands() {
   console.log(`Registered ${commands.length} slash commands in guild ${process.env.GUILD_ID}.`);
 }
 
-function helpEmbed() {
+function helpEmbed(guildId) {
+  const currentPrefix = guildId ? guildPrefix(guildId) : prefix;
   return new EmbedBuilder()
     .setColor(colors.brand)
     .setTitle('Ticket Bot Help')
-    .setDescription(`Use slash commands with "/" or the prefix command \`${prefix}help\`.`)
+    .setDescription(`Use slash commands with "/" or the prefix command \`${currentPrefix}help\`.`)
     .addFields(
       { name: 'Getting started', value: '`/ticket-setup` configures the category, support role, transcript channel, and panel.' },
       { name: 'Ticket controls', value: '`/ticket-close` `/ticket-reopen` `/ticket-claim` `/ticket-unclaim` `/ticket-transcript` `/ticket-rename` `/ticket-add` `/ticket-remove` `/ticket-delete`' },
       { name: 'Server administration', value: '`/ticket-config` `/ticket-blacklist` `/ticket-unblacklist`' },
     )
-    .setFooter({ text: `Prefix: ${prefix} | Slash commands are registered to this server.` });
+    .setFooter({ text: `Prefix: ${currentPrefix} | Slash commands are registered to this server.` });
 }
 
 async function sendTranscript(channel, ticket, interaction) {
@@ -326,8 +333,8 @@ client.on(Events.Warn, (warning) => {
 client.on(Events.MessageCreate, async (message) => {
   if (message.author.bot || !message.guild) return;
   const content = message.content.trim();
-  if (content.toLowerCase() !== `${prefix}help`.toLowerCase()) return;
-  await message.reply({ embeds: [helpEmbed()] });
+  if (content.toLowerCase() !== `${guildPrefix(message.guild.id)}help`.toLowerCase()) return;
+  await message.reply({ embeds: [helpEmbed(message.guild.id)] });
 });
 
 client.on(Events.InteractionCreate, async (interaction) => {
@@ -467,6 +474,15 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     if (!interaction.isChatInputCommand()) return;
     const name = interaction.commandName;
+    if (name === 'prefix') {
+      if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) return interaction.reply({ content: 'Only members with Manage Server can change the prefix.', ephemeral: true });
+      const newPrefix = interaction.options.getString('symbol').trim();
+      if (!/^[^\s`@#<>]{1,3}$/.test(newPrefix)) return interaction.reply({ content: 'Choose one to three non-space characters, such as `$`, `?`, or `!!`.', ephemeral: true });
+      const config = guildConfig(interaction.guildId);
+      config.prefix = newPrefix;
+      saveStore();
+      return interaction.reply({ content: `The server prefix is now \`${newPrefix}\`. Use \`${newPrefix}help\` for help.`, ephemeral: true });
+    }
     if (name === 'ticket-setup') {
       const config = guildConfig(interaction.guildId);
       config.categoryId = interaction.options.getChannel('category').id;
