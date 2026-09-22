@@ -152,6 +152,16 @@ function ticketForChannel(channelId) {
   return Object.values(store.tickets).find((ticket) => ticket.channelId === channelId);
 }
 
+async function openTicketForUser(guild, userId) {
+  const ticket = Object.values(store.tickets).find((entry) => entry.guildId === guild.id && entry.ownerId === userId && entry.status === 'open');
+  if (!ticket) return null;
+  const channel = await guild.channels.fetch(ticket.channelId).catch(() => null);
+  if (channel) return ticket;
+  delete store.tickets[ticket.id];
+  saveStore();
+  return null;
+}
+
 async function recoverTicketFromChannel(channel) {
   const existing = ticketForChannel(channel.id);
   if (existing || !channel?.topic) return existing;
@@ -417,7 +427,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (interaction.isStringSelectMenu() && interaction.customId === 'ticket:select') {
       const blacklist = store.blacklist[`${interaction.guildId}:${interaction.user.id}`];
       if (blacklist) return interaction.reply({ content: `You are blocked from opening tickets${blacklist.reason ? `: ${blacklist.reason}` : '.'}`, ephemeral: true });
-      const existing = Object.values(store.tickets).find((ticket) => ticket.guildId === interaction.guildId && ticket.ownerId === interaction.user.id && ticket.status === 'open');
+      const existing = await openTicketForUser(interaction.guild, interaction.user.id);
       if (existing) return interaction.reply({ content: `You already have an open ticket: <#${existing.channelId}>`, ephemeral: true });
       const limitMessage = canCreateTicket(interaction.guildId, interaction.user.id);
       if (limitMessage) return interaction.reply({ content: limitMessage, ephemeral: true });
@@ -434,7 +444,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (interaction.isButton() && interaction.customId === 'ticket:create') {
       const blacklist = store.blacklist[`${interaction.guildId}:${interaction.user.id}`];
       if (blacklist) return interaction.reply({ content: `You are blocked from opening tickets${blacklist.reason ? `: ${blacklist.reason}` : '.'}`, ephemeral: true });
-      const existing = Object.values(store.tickets).find((ticket) => ticket.guildId === interaction.guildId && ticket.ownerId === interaction.user.id && ticket.status === 'open');
+      const existing = await openTicketForUser(interaction.guild, interaction.user.id);
       if (existing) return interaction.reply({ content: `You already have an open ticket: <#${existing.channelId}>`, ephemeral: true });
       const limitMessage = canCreateTicket(interaction.guildId, interaction.user.id);
       if (limitMessage) return interaction.reply({ content: limitMessage, ephemeral: true });
