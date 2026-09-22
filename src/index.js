@@ -514,9 +514,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (name === 'ticket-add' || name === 'ticket-remove') { if (!isStaff(interaction)) return interaction.reply({ content: 'Staff only.', ephemeral: true }); const user = interaction.options.getUser('user'); await interaction.channel.permissionOverwrites.edit(user.id, name === 'ticket-add' ? { ViewChannel: true, SendMessages: true, ReadMessageHistory: true } : { ViewChannel: false }); return interaction.reply(`${user} ${name === 'ticket-add' ? 'added to' : 'removed from'} this ticket.`); }
     if (name === 'ticket-delete') { if (!isStaff(interaction) && interaction.user.id !== ticket.ownerId) return interaction.reply({ content: 'Only the ticket owner or staff can delete this ticket.', ephemeral: true }); await interaction.deferReply(); await sendTranscript(interaction.channel, ticket, interaction).catch(() => null); delete store.tickets[ticket.id]; saveStore(); await logEvent(interaction.guild, 'TICKET_DELETED', ticket, `Deleted by ${interaction.user.tag}`); await interaction.editReply('Deleting this ticket...'); return interaction.channel.delete(); }
   } catch (error) {
-    console.error(error);
+    const errorId = `ERR-${Date.now().toString(36).toUpperCase()}`;
+    console.error(`[${errorId}] Interaction ${interaction.type} ${interaction.customId || interaction.commandName || 'unknown'} failed:`, error);
     if (error?.code === 10062 || error?.code === 40060) return;
-    const response = { content: 'Something went wrong while handling that request.', ephemeral: true };
+    const response = { content: `Something went wrong while handling that request. Please contact staff with error ID \`${errorId}\`.`, ephemeral: true };
     if (interaction.deferred || interaction.replied) await interaction.followUp(response).catch(() => null); else await interaction.reply(response).catch(() => null);
   }
 });

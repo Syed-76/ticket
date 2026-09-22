@@ -11,7 +11,12 @@ async function allocateTicketNumber(guildId, ownerId, departmentId, localStore, 
     return number;
   }
   const { data, error } = await supabase.rpc('allocate_ticket_number', { p_guild_id: guildId, p_owner_id: ownerId, p_department_id: departmentId });
-  if (error) throw new Error(`Supabase ticket number allocation failed: ${error.message}`);
+  if (error) {
+    console.error(`Supabase ticket allocator unavailable; using local fallback: ${error.message}`);
+    const number = localStore.nextTicketNumber++;
+    saveLocalStore();
+    return number;
+  }
   return data;
 }
 
