@@ -119,6 +119,40 @@ function ticketForChannel(channelId) {
   return Object.values(store.tickets).find((ticket) => ticket.channelId === channelId);
 }
 
+async function recoverTicketFromChannel(channel) {
+  const existing = ticketForChannel(channel.id);
+  if (existing || !channel?.topic) return existing;
+  const match = channel.topic.match(/^ticket:(\d+):(\d+):([a-z_]+)$/);
+  if (!match || match[1] !== channel.guildId || !departments[match[3]]) return null;
+  const [, guildId, numberText, departmentId] = match;
+  const department = departmentConfig(guildId, departmentId);
+  const ownerOverwrite = channel.permissionOverwrites.cache.find((overwrite) => overwrite.type === 1 && overwrite.id !== department?.roleId && overwrite.allow.has(PermissionFlagsBits.ViewChannel));
+  if (!ownerOverwrite) return null;
+  const owner = await channel.guild.members.fetch(ownerOverwrite.id).catch(() => null);
+  const number = Number(numberText);
+  const ticket = {
+    id: `${guildId}:${number}`,
+    guildId,
+    channelId: channel.id,
+    ownerId: owner?.id || ownerOverwrite.id,
+    ownerUsername: owner?.user.username || 'user',
+    number,
+    channelName: channel.name,
+    departmentId,
+    subject: 'Recovered ticket',
+    description: 'Ticket record recovered from the channel metadata.',
+    reference: null,
+    status: 'open',
+    claimedBy: null,
+    claimedByName: null,
+    createdAt: channel.createdAt?.toISOString() || new Date().toISOString(),
+  };
+  store.tickets[ticket.id] = ticket;
+  saveStore();
+  await recordTicket(ticket);
+  return ticket;
+}
+
 function ticketType(ticket) {
   return departments[ticket.departmentId] || departments.general_support;
 }
@@ -409,7 +443,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     if (interaction.isModalSubmit() && interaction.customId.startsWith('ticket:add-member-modal:')) {
       await interaction.deferReply({ ephemeral: true });
-      const ticket = ticketForChannel(interaction.channelId);
+      const ticket = await recoverTicketFromChannel(interaction.channel);
       if (!ticket || !isStaff(interaction)) return interaction.editReply('This action is no longer available.');
       const userId = interaction.fields.getTextInputValue('user_id').trim();
       if (!/^\d{17,20}$/.test(userId)) return interaction.editReply('Enter a valid Discord user ID.');
@@ -421,7 +455,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     if (interaction.isModalSubmit() && interaction.customId.startsWith('ticket:delete-confirm:')) {
       await interaction.deferReply({ ephemeral: true });
-      const ticket = ticketForChannel(interaction.channelId);
+      const ticket = await recoverTicketFromChannel(interaction.channel);
       if (!ticket || !isStaff(interaction)) return interaction.editReply('Only authorized staff can delete this ticket.');
       if (interaction.fields.getTextInputValue('confirmation').trim().toUpperCase() !== 'DELETE') return interaction.editReply('Deletion cancelled. Type DELETE exactly to confirm.');
       const actionKey = `${ticket.id}:delete`;
@@ -442,7 +476,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     if (interaction.isButton() && interaction.customId.startsWith('ticket:')) {
-      const ticket = ticketForChannel(interaction.channelId);
+      const ticket = await recoverTicketFromChannel(interaction.channel);
       if (!ticket) return interaction.reply({ content: 'This button is no longer connected to an active ticket.', ephemeral: true });
       if (interaction.customId === 'ticket:close') {
         if (!isStaff(interaction) && interaction.user.id !== ticket.ownerId) return interaction.reply({ content: 'Only the ticket owner or staff can close this ticket.', ephemeral: true });
