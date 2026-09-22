@@ -18,9 +18,12 @@ const {
   REST,
   Routes,
   SlashCommandBuilder,
+  StringSelectMenuBuilder,
   TextInputBuilder,
   TextInputStyle,
 } = require('discord.js');
+const { connectDatabase, recordEvent, recordTicket } = require('./database');
+const { createDashboard } = require('./dashboard');
 
 const DATA_DIR = path.join(__dirname, '..', 'data');
 const TRANSCRIPT_DIR = path.join(__dirname, '..', 'transcripts');
@@ -37,6 +40,8 @@ const defaultStore = {
   guilds: {},
   tickets: {},
   blacklist: {},
+  ticketAttempts: {},
+  roundRobin: {},
 };
 
 function loadStore() {
@@ -48,16 +53,24 @@ function loadStore() {
 }
 
 let store = loadStore();
+store.ticketAttempts ??= {};
 function saveStore() {
   const tempFile = `${STORE_FILE}.tmp`;
   fs.writeFileSync(tempFile, JSON.stringify(store, null, 2));
   fs.renameSync(tempFile, STORE_FILE);
 }
 
-const colors = { brand: 0x2f80ed, success: 0x27ae60, danger: 0xeb5757, neutral: 0x5865f2 };
+const colors = { brand: 0x2f80ed, success: 0x27ae60, danger: 0xeb5757, neutral: 0x5865f2, warning: 0xf2c94c };
 const prefix = process.env.PREFIX || '!';
+const departments = {
+  general_support: { label: 'General Support', emoji: '🎫', prefix: 'support', categoryEnv: 'TICKET_SUPPORT_CATEGORY_ID', roleEnv: 'TICKET_SUPPORT_ROLE_ID', fallbackCategory: 'categoryId', fallbackRole: 'supportRoleId' },
+  member_report: { label: 'Player/Member Report', emoji: '🛡️', prefix: 'report', categoryEnv: 'TICKET_REPORT_CATEGORY_ID', roleEnv: 'TICKET_REPORT_ROLE_ID', fallbackCategory: 'categoryId', fallbackRole: 'supportRoleId' },
+  partnerships: { label: 'Partnerships', emoji: '🤝', prefix: 'partner', categoryEnv: 'TICKET_PARTNERSHIP_CATEGORY_ID', roleEnv: 'TICKET_PARTNERSHIP_ROLE_ID', fallbackCategory: 'categoryId', fallbackRole: 'supportRoleId' },
+  staff_application: { label: 'Staff Application', emoji: '📝', prefix: 'application', categoryEnv: 'TICKET_APPLICATION_CATEGORY_ID', roleEnv: 'TICKET_APPLICATION_ROLE_ID', fallbackCategory: 'categoryId', fallbackRole: 'supportRoleId' },
+  billing_donations: { label: 'Billing & Donations', emoji: '💳', prefix: 'billing', categoryEnv: 'TICKET_BILLING_CATEGORY_ID', roleEnv: 'TICKET_BILLING_ROLE_ID', fallbackCategory: 'categoryId', fallbackRole: 'supportRoleId' },
+};
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildPresences, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
 });
 
 function guildConfig(guildId) {
@@ -67,24 +80,87 @@ function guildConfig(guildId) {
       categoryId: process.env.TICKET_CATEGORY_ID || null,
       transcriptChannelId: process.env.TRANSCRIPT_CHANNEL_ID || null,
       panelChannelId: null,
+      departments: {},
     };
   }
+  store.guilds[guildId].departments ??= {};
   return store.guilds[guildId];
 }
 
+function departmentConfig(guildId, departmentId) {
+  const config = guildConfig(guildId);
+  const department = departments[departmentId];
+  if (!department) return null;
+  return {
+    ...department,
+    categoryId: config.departments[departmentId]?.categoryId || process.env[department.categoryEnv] || (department.fallbackCategory ? config[department.fallbackCategory] : null),
+    roleId: config.departments[departmentId]?.roleId || process.env[department.roleEnv] || (department.fallbackRole ? config[department.fallbackRole] : null),
+  };
+}
+
 function isStaff(interaction) {
-  return interaction.memberPermissions?.has(PermissionFlagsBits.ManageChannels) ||
-    interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild);
+  if (interaction.memberPermissions?.has(PermissionFlagsBits.ManageChannels) || interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) return true;
+  const ticket = ticketForChannel(interaction.channelId);
+  const roleIds = Object.keys(departments).map((departmentId) => departmentConfig(interaction.guildId, departmentId)?.roleId).filter(Boolean);
+  const ticketRoleId = ticket ? departmentConfig(interaction.guildId, ticket.departmentId)?.roleId : null;
+  return Boolean(ticketRoleId && roleIds.includes(ticketRoleId)) || roleIds.some((roleId) => interaction.member?.roles?.cache?.has(roleId));
 }
 
 function ticketForChannel(channelId) {
   return Object.values(store.tickets).find((ticket) => ticket.channelId === channelId);
 }
 
+function ticketType(ticket) {
+  return departments[ticket.departmentId] || departments.general_support;
+}
+
+function canCreateTicket(guildId, userId) {
+  const key = `${guildId}:${userId}`;
+  const now = Date.now();
+  const attempts = (store.ticketAttempts[key] || []).filter((timestamp) => now - timestamp < 24 * 60 * 60 * 1000);
+  store.ticketAttempts[key] = attempts;
+  if (attempts.length >= 3) return 'You have reached the limit of 3 ticket creations in 24 hours.';
+  const lastAttempt = attempts.at(-1);
+  if (lastAttempt && now - lastAttempt < 30 * 60 * 1000) return `Please wait ${Math.ceil((30 * 60 * 1000 - (now - lastAttempt)) / 60000)} minutes before opening another ticket.`;
+  return null;
+}
+
+function recordTicketAttempt(guildId, userId) {
+  const key = `${guildId}:${userId}`;
+  store.ticketAttempts[key] = [...(store.ticketAttempts[key] || []), Date.now()];
+}
+
+async function nextOnlineStaff(guild, roleId) {
+  if (!roleId) return null;
+  const members = await guild.members.fetch().catch(() => null);
+  if (!members) return null;
+  const available = members.filter((member) => !member.user.bot && member.roles.cache.has(roleId) && member.presence?.status && member.presence.status !== 'offline');
+  if (!available.size) return null;
+  const ids = [...available.keys()];
+  const index = store.roundRobin[guild.id] || 0;
+  const selected = ids[index % ids.length];
+  store.roundRobin[guild.id] = (index + 1) % ids.length;
+  return selected;
+}
+
+async function logEvent(guild, event, ticket, details = '', actorId = null) {
+  await recordEvent(guild.id, ticket, event, actorId, details);
+  const channelId = guildConfig(guild.id).transcriptChannelId;
+  const channel = channelId ? await guild.channels.fetch(channelId).catch(() => null) : null;
+  if (!channel?.isTextBased()) return;
+  await channel.send({ embeds: [new EmbedBuilder().setColor(event.includes('CLOSED') || event.includes('DELETED') ? colors.danger : colors.neutral).setTitle(event).addFields(
+    { name: 'Ticket', value: `#${ticket.number}`, inline: true },
+    { name: 'Type', value: ticketType(ticket).label, inline: true },
+    { name: 'Owner', value: `<@${ticket.ownerId}>`, inline: true },
+    ...(details ? [{ name: 'Details', value: details.slice(0, 1024) }] : []),
+  ).setTimestamp()] }).catch(() => null);
+}
+
 function ticketEmbed(ticket) {
+  const type = ticketType(ticket);
   return new EmbedBuilder()
     .setColor(ticket.status === 'open' ? colors.brand : colors.danger)
-    .setTitle(`${ticket.status === 'open' ? 'Support ticket' : 'Closed ticket'} #${ticket.number}`)
+    .setTitle(`${type.emoji} ${type.label} #${ticket.number}`)
     .setDescription(`**${ticket.subject || 'Support request'}**\n\n${ticket.description || 'No description provided.'}`)
     .addFields(
       { name: 'Owner', value: `<@${ticket.ownerId}>`, inline: true },
@@ -106,22 +182,23 @@ function ticketButtons(ticket) {
 }
 
 function panelComponents() {
-  return [new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('ticket:create').setLabel('Open a support ticket').setEmoji('🎫').setStyle(ButtonStyle.Primary),
-  )];
+  return [new ActionRowBuilder().addComponents(new StringSelectMenuBuilder()
+    .setCustomId('ticket:select')
+    .setPlaceholder('Select the department you need')
+    .addOptions(Object.entries(departments).map(([value, department]) => ({ label: department.label, value, emoji: department.emoji })) ))];
 }
 
 function panelEmbed() {
   return new EmbedBuilder()
     .setColor(colors.brand)
     .setTitle('Support Center')
-    .setDescription('Need help? Open a private ticket and our support team will get back to you.')
+    .setDescription('Need assistance? Select the department that best matches your request below.\n\nPlease provide complete and accurate information, including relevant usernames, timestamps, screenshots, and reference IDs. Do not open duplicate tickets or ping individual staff members.')
     .addFields(
-      { name: 'Before opening a ticket', value: 'Please check that you do not already have an open ticket and gather any order IDs, screenshots, or error messages.' },
-      { name: 'What should I write?', value: 'Tell us what happened, when it happened, what you expected, and what you have already tried. More detail helps us resolve your request faster.' },
+      { name: '🎫 General Support', value: 'Account, server, gameplay, technical, or general assistance.' },
+      { name: '🛡️ Reports • 🤝 Partnerships • 📝 Applications • 💳 Billing', value: 'Choose the matching department from the menu below.' },
       { name: 'Privacy', value: 'Only you and the support team will be able to see your ticket.' },
     )
-    .setFooter({ text: 'Click the button below to contact support.' });
+    .setFooter({ text: 'Support Center • One active ticket per member' });
 }
 
 function setupCommand() {
@@ -211,8 +288,11 @@ async function closeTicket(interaction, ticket, reason) {
   ticket.closedAt = new Date().toISOString();
   ticket.closeReason = reason || 'No reason provided';
   saveStore();
+  await recordTicket(ticket);
   await interaction.channel.permissionOverwrites.edit(ticket.ownerId, { SendMessages: false, ViewChannel: true });
-  await interaction.channel.setName(`closed-${ticket.number}`).catch(() => null);
+  await interaction.channel.setName(`closed-${ticketType(ticket).prefix}-${ticket.number}`).catch(() => null);
+  await sendTranscript(interaction.channel, ticket, interaction).catch(() => null);
+  await logEvent(interaction.guild, 'TICKET_CLOSED', ticket, `Closed by ${interaction.user.tag}. Reason: ${ticket.closeReason}`, interaction.user.id);
   const response = { embeds: [new EmbedBuilder().setColor(colors.danger).setTitle('Ticket closed').setDescription(`Closed by ${interaction.user}.\nReason: ${ticket.closeReason}`)], components: ticketButtons(ticket) };
   return interaction.deferred ? interaction.editReply(response) : interaction.reply(response);
 }
@@ -243,33 +323,62 @@ client.on(Events.MessageCreate, async (message) => {
 
 client.on(Events.InteractionCreate, async (interaction) => {
   try {
+    if (interaction.isStringSelectMenu() && interaction.customId === 'ticket:select') {
+      const blacklist = store.blacklist[`${interaction.guildId}:${interaction.user.id}`];
+      if (blacklist) return interaction.reply({ content: `You are blocked from opening tickets${blacklist.reason ? `: ${blacklist.reason}` : '.'}`, ephemeral: true });
+      const existing = Object.values(store.tickets).find((ticket) => ticket.guildId === interaction.guildId && ticket.ownerId === interaction.user.id && ticket.status === 'open');
+      if (existing) return interaction.reply({ content: `You already have an open ticket: <#${existing.channelId}>`, ephemeral: true });
+      const limitMessage = canCreateTicket(interaction.guildId, interaction.user.id);
+      if (limitMessage) return interaction.reply({ content: limitMessage, ephemeral: true });
+      const departmentId = interaction.values[0];
+      const department = departmentConfig(interaction.guildId, departmentId);
+      if (!department?.categoryId || !department.roleId) return interaction.reply({ content: 'This department is not configured yet. Please contact an administrator.', ephemeral: true });
+      const modal = new ModalBuilder().setCustomId(`ticket:create-modal:${departmentId}`).setTitle(department.label);
+      const subject = new TextInputBuilder().setCustomId('subject').setLabel('What do you need help with?').setPlaceholder('Provide a short, specific subject').setStyle(TextInputStyle.Short).setMaxLength(80).setRequired(true);
+      const description = new TextInputBuilder().setCustomId('description').setLabel('Explain the issue').setPlaceholder('What happened, when did it happen, and what have you tried?').setStyle(TextInputStyle.Paragraph).setMinLength(20).setMaxLength(2000).setRequired(true);
+      const reference = new TextInputBuilder().setCustomId('reference').setLabel('Reference, user ID, or order ID (optional)').setPlaceholder('Leave blank if this does not apply').setStyle(TextInputStyle.Short).setMaxLength(100).setRequired(false);
+      return interaction.showModal(modal.addComponents(new ActionRowBuilder().addComponents(subject), new ActionRowBuilder().addComponents(description), new ActionRowBuilder().addComponents(reference)));
+    }
+
     if (interaction.isButton() && interaction.customId === 'ticket:create') {
       const blacklist = store.blacklist[`${interaction.guildId}:${interaction.user.id}`];
       if (blacklist) return interaction.reply({ content: `You are blocked from opening tickets${blacklist.reason ? `: ${blacklist.reason}` : '.'}`, ephemeral: true });
       const existing = Object.values(store.tickets).find((ticket) => ticket.guildId === interaction.guildId && ticket.ownerId === interaction.user.id && ticket.status === 'open');
       if (existing) return interaction.reply({ content: `You already have an open ticket: <#${existing.channelId}>`, ephemeral: true });
-      const modal = new ModalBuilder().setCustomId('ticket:create-modal').setTitle('Open a support ticket');
+      const limitMessage = canCreateTicket(interaction.guildId, interaction.user.id);
+      if (limitMessage) return interaction.reply({ content: limitMessage, ephemeral: true });
+      const departmentId = 'general_support';
+      const department = departmentConfig(interaction.guildId, departmentId);
+      if (!department?.categoryId || !department.roleId) return interaction.reply({ content: 'Ticket setup is incomplete. Ask an administrator to configure the support department.', ephemeral: true });
+      const modal = new ModalBuilder().setCustomId(`ticket:create-modal:${departmentId}`).setTitle('Open a support ticket');
       const subject = new TextInputBuilder().setCustomId('subject').setLabel('What do you need help with?').setPlaceholder('Example: Payment failed on my order').setStyle(TextInputStyle.Short).setMaxLength(80).setRequired(true);
       const description = new TextInputBuilder().setCustomId('description').setLabel('Explain the issue').setPlaceholder('What happened, when did it happen, and what have you tried?').setStyle(TextInputStyle.Paragraph).setMaxLength(2000).setRequired(true);
       const reference = new TextInputBuilder().setCustomId('reference').setLabel('Order ID or useful reference (optional)').setPlaceholder('Leave blank if this does not apply').setStyle(TextInputStyle.Short).setMaxLength(100).setRequired(false);
       return interaction.showModal(modal.addComponents(new ActionRowBuilder().addComponents(subject), new ActionRowBuilder().addComponents(description), new ActionRowBuilder().addComponents(reference)));
     }
 
-    if (interaction.isModalSubmit() && interaction.customId === 'ticket:create-modal') {
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('ticket:create-modal:')) {
       await interaction.deferReply({ ephemeral: true });
-      const config = guildConfig(interaction.guildId);
-      if (!config.categoryId || !config.supportRoleId) return interaction.editReply('Ticket setup is incomplete. Ask an administrator to run `/ticket-setup`.');
+      const departmentId = interaction.customId.split(':').at(-1);
+      const department = departmentConfig(interaction.guildId, departmentId);
+      const limitMessage = canCreateTicket(interaction.guildId, interaction.user.id);
+      if (limitMessage) return interaction.editReply(limitMessage);
+      if (!department?.categoryId || !department.roleId) return interaction.editReply('This department is not configured yet. Ask an administrator to configure it.');
       const number = store.nextTicketNumber++;
       const ticketId = `${interaction.guildId}:${number}`;
-      const channel = await interaction.guild.channels.create({ name: `ticket-${number}`, type: ChannelType.GuildText, parent: config.categoryId, topic: `ticket:${ticketId}`, permissionOverwrites: [
+      const channel = await interaction.guild.channels.create({ name: `${department.prefix}-${number}`, type: ChannelType.GuildText, parent: department.categoryId, topic: `ticket:${ticketId}:${departmentId}`, permissionOverwrites: [
         { id: interaction.guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel] },
         { id: interaction.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] },
-        { id: config.supportRoleId, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.ManageMessages] },
+        { id: department.roleId, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.ManageMessages] },
       ] });
-      const ticket = { id: ticketId, guildId: interaction.guildId, channelId: channel.id, ownerId: interaction.user.id, number, subject: interaction.fields.getTextInputValue('subject'), description: interaction.fields.getTextInputValue('description'), reference: interaction.fields.getTextInputValue('reference') || null, status: 'open', claimedBy: null, createdAt: new Date().toISOString() };
+      const ticket = { id: ticketId, guildId: interaction.guildId, channelId: channel.id, ownerId: interaction.user.id, number, departmentId, subject: interaction.fields.getTextInputValue('subject'), description: interaction.fields.getTextInputValue('description'), reference: interaction.fields.getTextInputValue('reference') || null, status: 'open', claimedBy: null, createdAt: new Date().toISOString() };
+      ticket.claimedBy = await nextOnlineStaff(interaction.guild, department.roleId);
       store.tickets[ticketId] = ticket;
+      recordTicketAttempt(interaction.guildId, interaction.user.id);
       saveStore();
-      await channel.send({ content: `<@${interaction.user.id}> <@&${config.supportRoleId}>`, embeds: [ticketEmbed(ticket)], components: ticketButtons(ticket) });
+      await recordTicket(ticket);
+      await channel.send({ content: `<@${interaction.user.id}> <@&${department.roleId}>`, embeds: [ticketEmbed(ticket)], components: ticketButtons(ticket) });
+      await logEvent(interaction.guild, 'TICKET_OPENED', ticket, `Created by ${interaction.user.tag}${ticket.claimedBy ? `; assigned to <@${ticket.claimedBy}>` : '; no online staff were available'}`, ticket.claimedBy);
       return interaction.editReply(`Your ticket is ready: ${channel}`);
     }
 
@@ -286,19 +395,25 @@ client.on(Events.InteractionCreate, async (interaction) => {
         await interaction.deferReply();
         ticket.claimedBy = ticket.claimedBy === interaction.user.id ? null : interaction.user.id;
         saveStore();
+        await recordTicket(ticket);
+        await logEvent(interaction.guild, ticket.claimedBy ? 'TICKET_CLAIMED' : 'TICKET_UNCLAIMED', ticket, ticket.claimedBy ? `Claimed by ${interaction.user.tag}` : `Unclaimed by ${interaction.user.tag}`, interaction.user.id);
         return interaction.editReply({ content: ticket.claimedBy ? `Ticket claimed by ${interaction.user}.` : 'Ticket is now unclaimed.', components: ticketButtons(ticket) });
       }
       if (interaction.customId === 'ticket:transcript') {
         if (!isStaff(interaction)) return interaction.reply({ content: 'Only support staff can generate transcripts.', ephemeral: true });
         await interaction.deferReply({ ephemeral: true });
         const filePath = await sendTranscript(interaction.channel, ticket, interaction);
+        await logEvent(interaction.guild, 'TICKET_TRANSCRIPT_CREATED', ticket, `Generated by ${interaction.user.tag}`);
         return interaction.editReply({ content: 'Transcript generated successfully.', files: [new AttachmentBuilder(filePath)] });
       }
       if (interaction.customId === 'ticket:delete') {
         if (!isStaff(interaction) && interaction.user.id !== ticket.ownerId) return interaction.reply({ content: 'Only the ticket owner or staff can delete this ticket.', ephemeral: true });
         await interaction.deferReply();
+        await sendTranscript(interaction.channel, ticket, interaction).catch(() => null);
         delete store.tickets[ticket.id];
         saveStore();
+          ticket.transcriptPath = await sendTranscript(interaction.channel, ticket, interaction).catch(() => null);
+          await recordTicket(ticket);
         await interaction.editReply('Deleting this ticket...');
         return interaction.channel.delete();
       }
@@ -308,8 +423,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
         ticket.status = 'open';
         ticket.closedAt = null;
         saveStore();
+          await recordTicket(ticket);
         await interaction.channel.permissionOverwrites.edit(ticket.ownerId, { SendMessages: true, ViewChannel: true });
-        await interaction.channel.setName(`ticket-${ticket.number}`).catch(() => null);
+        await interaction.channel.setName(`${ticketType(ticket).prefix}-${ticket.number}`).catch(() => null);
+        await logEvent(interaction.guild, 'TICKET_REOPENED', ticket, `Reopened by ${interaction.user.tag}`);
         return interaction.editReply({ embeds: [new EmbedBuilder().setColor(colors.success).setTitle('Ticket reopened').setDescription(`Reopened by ${interaction.user}.`)], components: ticketButtons(ticket) });
       }
     }
@@ -328,7 +445,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
     if (name === 'ticket-config') {
       const config = guildConfig(interaction.guildId);
-      return interaction.reply({ content: `Category: ${config.categoryId ? `<#${config.categoryId}>` : 'not set'}\nSupport role: ${config.supportRoleId ? `<@&${config.supportRoleId}>` : 'not set'}\nTranscript channel: ${config.transcriptChannelId ? `<#${config.transcriptChannelId}>` : 'not set'}\nPanel channel: ${config.panelChannelId ? `<#${config.panelChannelId}>` : 'not set'}`, ephemeral: true });
+      const departmentStatus = Object.entries(departments).map(([id, department]) => { const resolved = departmentConfig(interaction.guildId, id); return `${department.emoji} ${department.label}: ${resolved?.categoryId ? `<#${resolved.categoryId}>` : 'category not set'} / ${resolved?.roleId ? `<@&${resolved.roleId}>` : 'role not set'}`; }).join('\n');
+      return interaction.reply({ content: `Category: ${config.categoryId ? `<#${config.categoryId}>` : 'not set'}\nSupport role: ${config.supportRoleId ? `<@&${config.supportRoleId}>` : 'not set'}\nTranscript channel: ${config.transcriptChannelId ? `<#${config.transcriptChannelId}>` : 'not set'}\nPanel channel: ${config.panelChannelId ? `<#${config.panelChannelId}>` : 'not set'}\n\nDepartments:\n${departmentStatus}`, ephemeral: true });
     }
     if (name === 'ticket-blacklist' || name === 'ticket-unblacklist') {
       if (!isStaff(interaction)) return interaction.reply({ content: 'Staff only.', ephemeral: true });
@@ -345,21 +463,23 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (!isStaff(interaction)) return interaction.reply({ content: 'Staff only.', ephemeral: true });
       ticket.status = 'open'; ticket.closedAt = null; saveStore();
       await interaction.channel.permissionOverwrites.edit(ticket.ownerId, { SendMessages: true, ViewChannel: true });
-      await interaction.channel.setName(`ticket-${ticket.number}`).catch(() => null);
+      await interaction.channel.setName(`${ticketType(ticket).prefix}-${ticket.number}`).catch(() => null);
+      await logEvent(interaction.guild, 'TICKET_REOPENED', ticket, `Reopened by ${interaction.user.tag}`);
       return interaction.reply({ embeds: [new EmbedBuilder().setColor(colors.success).setTitle('Ticket reopened').setDescription(`Reopened by ${interaction.user}.`)], components: ticketButtons(ticket) });
     }
     if (name === 'ticket-claim' || name === 'ticket-unclaim') {
       if (!isStaff(interaction)) return interaction.reply({ content: 'Staff only.', ephemeral: true });
       ticket.claimedBy = name === 'ticket-unclaim' ? null : (ticket.claimedBy === interaction.user.id ? null : interaction.user.id); saveStore();
+      await logEvent(interaction.guild, ticket.claimedBy ? 'TICKET_CLAIMED' : 'TICKET_UNCLAIMED', ticket, ticket.claimedBy ? `Claimed by ${interaction.user.tag}` : `Unclaimed by ${interaction.user.tag}`);
       return interaction.reply({ content: ticket.claimedBy ? `Claimed by ${interaction.user}.` : 'Ticket is now unclaimed.' });
     }
     if (name === 'ticket-transcript') {
       if (!isStaff(interaction)) return interaction.reply({ content: 'Staff only.', ephemeral: true });
-      await interaction.deferReply({ ephemeral: true }); const filePath = await sendTranscript(interaction.channel, ticket, interaction); return interaction.editReply({ content: 'Transcript generated.', files: [new AttachmentBuilder(filePath)] });
+      await interaction.deferReply({ ephemeral: true }); const filePath = await sendTranscript(interaction.channel, ticket, interaction); await logEvent(interaction.guild, 'TICKET_TRANSCRIPT_CREATED', ticket, `Generated by ${interaction.user.tag}`); return interaction.editReply({ content: 'Transcript generated.', files: [new AttachmentBuilder(filePath)] });
     }
     if (name === 'ticket-rename') { if (!isStaff(interaction)) return interaction.reply({ content: 'Staff only.', ephemeral: true }); await interaction.channel.setName(interaction.options.getString('name').toLowerCase().replace(/[^a-z0-9-]/g, '-').slice(0, 90)); return interaction.reply('Ticket renamed.'); }
     if (name === 'ticket-add' || name === 'ticket-remove') { if (!isStaff(interaction)) return interaction.reply({ content: 'Staff only.', ephemeral: true }); const user = interaction.options.getUser('user'); await interaction.channel.permissionOverwrites.edit(user.id, name === 'ticket-add' ? { ViewChannel: true, SendMessages: true, ReadMessageHistory: true } : { ViewChannel: false }); return interaction.reply(`${user} ${name === 'ticket-add' ? 'added to' : 'removed from'} this ticket.`); }
-    if (name === 'ticket-delete') { if (!isStaff(interaction) && interaction.user.id !== ticket.ownerId) return interaction.reply({ content: 'Only the ticket owner or staff can delete this ticket.', ephemeral: true }); await interaction.reply('Deleting this ticket...'); delete store.tickets[ticket.id]; saveStore(); return interaction.channel.delete(); }
+    if (name === 'ticket-delete') { if (!isStaff(interaction) && interaction.user.id !== ticket.ownerId) return interaction.reply({ content: 'Only the ticket owner or staff can delete this ticket.', ephemeral: true }); await interaction.deferReply(); await sendTranscript(interaction.channel, ticket, interaction).catch(() => null); delete store.tickets[ticket.id]; saveStore(); await logEvent(interaction.guild, 'TICKET_DELETED', ticket, `Deleted by ${interaction.user.tag}`); await interaction.editReply('Deleting this ticket...'); return interaction.channel.delete(); }
   } catch (error) {
     console.error(error);
     if (error?.code === 10062 || error?.code === 40060) return;
@@ -372,4 +492,16 @@ process.on('unhandledRejection', (error) => {
   console.error('Unhandled promise rejection:', error);
 });
 
-client.login(process.env.DISCORD_TOKEN);
+async function start() {
+  const dashboard = createDashboard({ store, guildConfig, transcriptDir: TRANSCRIPT_DIR });
+  dashboard.app.listen(dashboard.port, '0.0.0.0', () => {
+    console.log(`Dashboard listening on port ${dashboard.port}.`);
+  });
+  await connectDatabase();
+  await client.login(process.env.DISCORD_TOKEN);
+}
+
+start().catch((error) => {
+  console.error('Fatal startup error:', error);
+  process.exitCode = 1;
+});

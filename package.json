@@ -6,6 +6,10 @@
   "type": "commonjs",
   "scripts": {
     "start": "node src/index.js",
+    "build": "vite build --config web/vite.config.js",
+    "start:web": "node src/index.js",
+    "dev:web": "vite --config web/vite.config.js",
+    "healthcheck": "node scripts/ping.js",
     "start:managed": "pm2 start ecosystem.config.cjs",
     "stop:managed": "pm2 stop ticket-bot",
     "logs:managed": "pm2 logs ticket-bot",
@@ -16,6 +20,15 @@
   },
   "dependencies": {
     "discord.js": "^14.22.1",
-    "dotenv": "^16.6.1"
+    "dotenv": "^16.6.1",
+    "express": "^5.2.1",
+    "mongoose": "^9.10.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^5.0.4",
+    "vite": "^8.3.0",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "tailwindcss": "^4.1.14"
   }
 }
