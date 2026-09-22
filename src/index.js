@@ -29,8 +29,41 @@ const { allocateTicketNumber, syncTicketWebhook } = require('./supabase');
 const DATA_DIR = path.join(__dirname, '..', 'data');
 const TRANSCRIPT_DIR = path.join(__dirname, '..', 'transcripts');
 const STORE_FILE = path.join(DATA_DIR, 'store.json');
+const LOCK_FILE = path.join(DATA_DIR, 'bot.lock');
 fs.mkdirSync(DATA_DIR, { recursive: true });
 fs.mkdirSync(TRANSCRIPT_DIR, { recursive: true });
+
+function acquireProcessLock() {
+  try {
+    const descriptor = fs.openSync(LOCK_FILE, 'wx');
+    fs.writeFileSync(descriptor, String(process.pid));
+    fs.closeSync(descriptor);
+  } catch (error) {
+    if (error.code !== 'EEXIST') throw error;
+    const previousPid = Number(fs.readFileSync(LOCK_FILE, 'utf8'));
+    try {
+      process.kill(previousPid, 0);
+      throw new Error(`Another ticket bot process is already running (PID ${previousPid}). Stop it before starting another instance.`);
+    } catch (processError) {
+      if (processError.message.startsWith('Another ticket bot process')) throw processError;
+      fs.unlinkSync(LOCK_FILE);
+      acquireProcessLock();
+    }
+  }
+}
+
+function releaseProcessLock() {
+  try {
+    if (Number(fs.readFileSync(LOCK_FILE, 'utf8')) === process.pid) fs.unlinkSync(LOCK_FILE);
+  } catch {
+    // The lock is already gone or belongs to another process.
+  }
+}
+
+acquireProcessLock();
+process.once('exit', releaseProcessLock);
+process.once('SIGINT', () => { releaseProcessLock(); process.exit(0); });
+process.once('SIGTERM', () => { releaseProcessLock(); process.exit(0); });
 
 if (!process.env.DISCORD_TOKEN || process.env.DISCORD_TOKEN === 'your_bot_token') {
   throw new Error('Missing DISCORD_TOKEN. Copy .env.example to .env and add your Discord bot token.');
