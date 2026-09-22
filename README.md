@@ -68,7 +68,26 @@ The prefix help command is `!help` by default. Change `PREFIX` in `.env` to use 
 - `/ticket-rename name`
 - `/ticket-add user`
 - `/ticket-remove user`
-- `/ticket-delete`
+	- `/ticket-delete`
+
+Ticket channels use the format `ticket-username-0001`, sanitized to Discord's 32-character limit. The four ticket controls are Close Ticket, Claim Ticket, Add Member, and View Logs.
+
+For a globally unique suffix across every guild, run `supabase/migrations/001_ticket_sequences.sql` in Supabase and set `SUPABASE_URL` plus `SUPABASE_SERVICE_ROLE_KEY`. Without Supabase, development falls back to the local JSON counter.
+
+The dashboard sync contract is `POST DASHBOARD_WEBHOOK_URL` with `Authorization: Bearer DASHBOARD_WEBHOOK_SECRET` and this payload shape:
+
+```json
+{
+	"event": "TICKET_OPENED",
+	"ticket": {
+		"id": "guild-id:142",
+		"number": 142,
+		"channelName": "ticket-username-0142",
+		"status": "open",
+		"claimedBy": "discord-user-id"
+	}
+}
+```
 
 The bot stores configuration and ticket metadata in `data/store.json`. Transcript HTML files are written to `transcripts/`.
 

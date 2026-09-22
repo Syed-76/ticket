@@ -24,6 +24,7 @@ const {
 } = require('discord.js');
 const { connectDatabase, recordEvent, recordTicket } = require('./database');
 const { createDashboard } = require('./dashboard');
+const { allocateTicketNumber, syncTicketWebhook } = require('./supabase');
 
 const DATA_DIR = path.join(__dirname, '..', 'data');
 const TRANSCRIPT_DIR = path.join(__dirname, '..', 'transcripts');
@@ -130,6 +131,14 @@ function recordTicketAttempt(guildId, userId) {
   store.ticketAttempts[key] = [...(store.ticketAttempts[key] || []), Date.now()];
 }
 
+function ticketChannelName(username, ticketNumber) {
+  const cleanUsername = String(username || 'user').toLowerCase().replace(/[^a-z0-9]/g, '') || 'user';
+  const paddedNumber = String(ticketNumber).padStart(4, '0');
+  const suffix = `-${paddedNumber}`;
+  const availableUsernameLength = Math.max(1, 32 - 'ticket-'.length - suffix.length);
+  return `ticket-${cleanUsername.slice(0, availableUsernameLength)}${suffix}`;
+}
+
 async function nextOnlineStaff(guild, roleId) {
   if (!roleId) return null;
   const members = await guild.members.fetch().catch(() => null);
@@ -145,6 +154,7 @@ async function nextOnlineStaff(guild, roleId) {
 
 async function logEvent(guild, event, ticket, details = '', actorId = null) {
   await recordEvent(guild.id, ticket, event, actorId, details);
+  await syncTicketWebhook(ticket, event);
   const channelId = guildConfig(guild.id).transcriptChannelId;
   const channel = channelId ? await guild.channels.fetch(channelId).catch(() => null) : null;
   if (!channel?.isTextBased()) return;
@@ -174,10 +184,10 @@ function ticketEmbed(ticket) {
 
 function ticketButtons(ticket) {
   return [new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('ticket:claim').setLabel(ticket.claimedBy ? 'Unclaim' : 'Claim').setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId(ticket.status === 'open' ? 'ticket:close' : 'ticket:reopen').setLabel(ticket.status === 'open' ? 'Close' : 'Reopen').setStyle(ticket.status === 'open' ? ButtonStyle.Danger : ButtonStyle.Success),
-    new ButtonBuilder().setCustomId('ticket:transcript').setLabel('Transcript').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId('ticket:delete').setLabel('Delete').setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId(ticket.status === 'open' ? 'ticket:close' : 'ticket:reopen').setLabel(ticket.status === 'open' ? '🔒 Close Ticket' : '🔓 Reopen Ticket').setStyle(ticket.status === 'open' ? ButtonStyle.Danger : ButtonStyle.Success),
+    new ButtonBuilder().setCustomId('ticket:claim').setLabel(ticket.claimedBy ? '📌 Unclaim Ticket' : '📌 Claim Ticket').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('ticket:add-member').setLabel('👤 Add Member').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('ticket:logs').setLabel('📊 View Logs').setStyle(ButtonStyle.Secondary),
   )];
 }
 
@@ -288,10 +298,9 @@ async function closeTicket(interaction, ticket, reason) {
   ticket.closedAt = new Date().toISOString();
   ticket.closeReason = reason || 'No reason provided';
   saveStore();
-  await recordTicket(ticket);
   await interaction.channel.permissionOverwrites.edit(ticket.ownerId, { SendMessages: false, ViewChannel: true });
-  await interaction.channel.setName(`closed-${ticketType(ticket).prefix}-${ticket.number}`).catch(() => null);
-  await sendTranscript(interaction.channel, ticket, interaction).catch(() => null);
+  ticket.transcriptPath = await sendTranscript(interaction.channel, ticket, interaction).catch(() => null);
+  await recordTicket(ticket);
   await logEvent(interaction.guild, 'TICKET_CLOSED', ticket, `Closed by ${interaction.user.tag}. Reason: ${ticket.closeReason}`, interaction.user.id);
   const response = { embeds: [new EmbedBuilder().setColor(colors.danger).setTitle('Ticket closed').setDescription(`Closed by ${interaction.user}.\nReason: ${ticket.closeReason}`)], components: ticketButtons(ticket) };
   return interaction.deferred ? interaction.editReply(response) : interaction.reply(response);
@@ -334,9 +343,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const department = departmentConfig(interaction.guildId, departmentId);
       if (!department?.categoryId || !department.roleId) return interaction.reply({ content: 'This department is not configured yet. Please contact an administrator.', ephemeral: true });
       const modal = new ModalBuilder().setCustomId(`ticket:create-modal:${departmentId}`).setTitle(department.label);
-      const subject = new TextInputBuilder().setCustomId('subject').setLabel('What do you need help with?').setPlaceholder('Provide a short, specific subject').setStyle(TextInputStyle.Short).setMaxLength(80).setRequired(true);
-      const description = new TextInputBuilder().setCustomId('description').setLabel('Explain the issue').setPlaceholder('What happened, when did it happen, and what have you tried?').setStyle(TextInputStyle.Paragraph).setMinLength(20).setMaxLength(2000).setRequired(true);
-      const reference = new TextInputBuilder().setCustomId('reference').setLabel('Reference, user ID, or order ID (optional)').setPlaceholder('Leave blank if this does not apply').setStyle(TextInputStyle.Short).setMaxLength(100).setRequired(false);
+      const subject = new TextInputBuilder().setCustomId('subject').setLabel('What is your main concern?').setPlaceholder('Example: Payment failed on my order').setStyle(TextInputStyle.Short).setMaxLength(80).setRequired(true);
+      const description = new TextInputBuilder().setCustomId('description').setLabel('Describe what happened').setPlaceholder('Include the timeline, impact, and what you already tried.').setStyle(TextInputStyle.Paragraph).setMinLength(20).setMaxLength(2000).setRequired(true);
+      const reference = new TextInputBuilder().setCustomId('reference').setLabel('Provide evidence links (if any)').setPlaceholder('Screenshots, videos, logs, order IDs, or related links').setStyle(TextInputStyle.Short).setMaxLength(100).setRequired(false);
       return interaction.showModal(modal.addComponents(new ActionRowBuilder().addComponents(subject), new ActionRowBuilder().addComponents(description), new ActionRowBuilder().addComponents(reference)));
     }
 
@@ -351,9 +360,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const department = departmentConfig(interaction.guildId, departmentId);
       if (!department?.categoryId || !department.roleId) return interaction.reply({ content: 'Ticket setup is incomplete. Ask an administrator to configure the support department.', ephemeral: true });
       const modal = new ModalBuilder().setCustomId(`ticket:create-modal:${departmentId}`).setTitle('Open a support ticket');
-      const subject = new TextInputBuilder().setCustomId('subject').setLabel('What do you need help with?').setPlaceholder('Example: Payment failed on my order').setStyle(TextInputStyle.Short).setMaxLength(80).setRequired(true);
-      const description = new TextInputBuilder().setCustomId('description').setLabel('Explain the issue').setPlaceholder('What happened, when did it happen, and what have you tried?').setStyle(TextInputStyle.Paragraph).setMaxLength(2000).setRequired(true);
-      const reference = new TextInputBuilder().setCustomId('reference').setLabel('Order ID or useful reference (optional)').setPlaceholder('Leave blank if this does not apply').setStyle(TextInputStyle.Short).setMaxLength(100).setRequired(false);
+      const subject = new TextInputBuilder().setCustomId('subject').setLabel('What is your main concern?').setPlaceholder('Example: Payment failed on my order').setStyle(TextInputStyle.Short).setMaxLength(80).setRequired(true);
+      const description = new TextInputBuilder().setCustomId('description').setLabel('Describe what happened').setPlaceholder('Include the timeline, impact, and what you already tried.').setStyle(TextInputStyle.Paragraph).setMaxLength(2000).setRequired(true);
+      const reference = new TextInputBuilder().setCustomId('reference').setLabel('Provide evidence links (if any)').setPlaceholder('Screenshots, videos, logs, order IDs, or related links').setStyle(TextInputStyle.Short).setMaxLength(100).setRequired(false);
       return interaction.showModal(modal.addComponents(new ActionRowBuilder().addComponents(subject), new ActionRowBuilder().addComponents(description), new ActionRowBuilder().addComponents(reference)));
     }
 
@@ -364,14 +373,15 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const limitMessage = canCreateTicket(interaction.guildId, interaction.user.id);
       if (limitMessage) return interaction.editReply(limitMessage);
       if (!department?.categoryId || !department.roleId) return interaction.editReply('This department is not configured yet. Ask an administrator to configure it.');
-      const number = store.nextTicketNumber++;
+      const number = await allocateTicketNumber(interaction.guildId, interaction.user.id, departmentId, store, saveStore);
       const ticketId = `${interaction.guildId}:${number}`;
-      const channel = await interaction.guild.channels.create({ name: `${department.prefix}-${number}`, type: ChannelType.GuildText, parent: department.categoryId, topic: `ticket:${ticketId}:${departmentId}`, permissionOverwrites: [
+      const channelName = ticketChannelName(interaction.user.username, number);
+      const channel = await interaction.guild.channels.create({ name: channelName, type: ChannelType.GuildText, parent: department.categoryId, topic: `ticket:${ticketId}:${departmentId}`, permissionOverwrites: [
         { id: interaction.guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel] },
         { id: interaction.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] },
         { id: department.roleId, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.ManageMessages] },
       ] });
-      const ticket = { id: ticketId, guildId: interaction.guildId, channelId: channel.id, ownerId: interaction.user.id, number, departmentId, subject: interaction.fields.getTextInputValue('subject'), description: interaction.fields.getTextInputValue('description'), reference: interaction.fields.getTextInputValue('reference') || null, status: 'open', claimedBy: null, createdAt: new Date().toISOString() };
+      const ticket = { id: ticketId, guildId: interaction.guildId, channelId: channel.id, ownerId: interaction.user.id, ownerUsername: interaction.user.username, number, channelName, departmentId, subject: interaction.fields.getTextInputValue('subject'), description: interaction.fields.getTextInputValue('description'), reference: interaction.fields.getTextInputValue('reference') || null, status: 'open', claimedBy: null, createdAt: new Date().toISOString() };
       ticket.claimedBy = await nextOnlineStaff(interaction.guild, department.roleId);
       store.tickets[ticketId] = ticket;
       recordTicketAttempt(interaction.guildId, interaction.user.id);
@@ -380,6 +390,18 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await channel.send({ content: `<@${interaction.user.id}> <@&${department.roleId}>`, embeds: [ticketEmbed(ticket)], components: ticketButtons(ticket) });
       await logEvent(interaction.guild, 'TICKET_OPENED', ticket, `Created by ${interaction.user.tag}${ticket.claimedBy ? `; assigned to <@${ticket.claimedBy}>` : '; no online staff were available'}`, ticket.claimedBy);
       return interaction.editReply(`Your ticket is ready: ${channel}`);
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('ticket:add-member-modal:')) {
+      await interaction.deferReply({ ephemeral: true });
+      const ticket = ticketForChannel(interaction.channelId);
+      if (!ticket || !isStaff(interaction)) return interaction.editReply('This action is no longer available.');
+      const userId = interaction.fields.getTextInputValue('user_id').trim();
+      if (!/^\d{17,20}$/.test(userId)) return interaction.editReply('Enter a valid Discord user ID.');
+      const member = await interaction.guild.members.fetch(userId).catch(() => null);
+      if (!member) return interaction.editReply('That member is not in this server.');
+      await interaction.channel.permissionOverwrites.edit(userId, { ViewChannel: true, SendMessages: true, ReadMessageHistory: true });
+      return interaction.editReply(`${member} was added to this ticket.`);
     }
 
     if (interaction.isButton() && interaction.customId.startsWith('ticket:')) {
@@ -399,6 +421,18 @@ client.on(Events.InteractionCreate, async (interaction) => {
         await logEvent(interaction.guild, ticket.claimedBy ? 'TICKET_CLAIMED' : 'TICKET_UNCLAIMED', ticket, ticket.claimedBy ? `Claimed by ${interaction.user.tag}` : `Unclaimed by ${interaction.user.tag}`, interaction.user.id);
         return interaction.editReply({ content: ticket.claimedBy ? `Ticket claimed by ${interaction.user}.` : 'Ticket is now unclaimed.', components: ticketButtons(ticket) });
       }
+      if (interaction.customId === 'ticket:add-member') {
+        if (!isStaff(interaction)) return interaction.reply({ content: 'Only support staff can add members.', ephemeral: true });
+        const modal = new ModalBuilder().setCustomId(`ticket:add-member-modal:${ticket.id}`).setTitle('Add a ticket member');
+        const userId = new TextInputBuilder().setCustomId('user_id').setLabel('Discord user ID').setPlaceholder('Paste the member ID').setStyle(TextInputStyle.Short).setMinLength(17).setMaxLength(20).setRequired(true);
+        return interaction.showModal(modal.addComponents(new ActionRowBuilder().addComponents(userId)));
+      }
+      if (interaction.customId === 'ticket:logs') {
+        if (!isStaff(interaction)) return interaction.reply({ content: 'Only support staff can view ticket logs.', ephemeral: true });
+        const messages = await interaction.channel.messages.fetch({ limit: 50 });
+        const logLines = [...messages.values()].filter((message) => message.author.id === client.user.id).slice(-10).map((message) => `• ${message.createdAt.toISOString()} — ${message.embeds[0]?.title || 'Ticket event'}`);
+        return interaction.reply({ embeds: [new EmbedBuilder().setColor(colors.neutral).setTitle(`Activity log • Ticket #${ticket.number}`).setDescription(logLines.join('\n') || 'No bot activity has been recorded in this channel.')], ephemeral: true });
+      }
       if (interaction.customId === 'ticket:transcript') {
         if (!isStaff(interaction)) return interaction.reply({ content: 'Only support staff can generate transcripts.', ephemeral: true });
         await interaction.deferReply({ ephemeral: true });
@@ -409,11 +443,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (interaction.customId === 'ticket:delete') {
         if (!isStaff(interaction) && interaction.user.id !== ticket.ownerId) return interaction.reply({ content: 'Only the ticket owner or staff can delete this ticket.', ephemeral: true });
         await interaction.deferReply();
-        await sendTranscript(interaction.channel, ticket, interaction).catch(() => null);
         delete store.tickets[ticket.id];
         saveStore();
-          ticket.transcriptPath = await sendTranscript(interaction.channel, ticket, interaction).catch(() => null);
-          await recordTicket(ticket);
+        ticket.transcriptPath = await sendTranscript(interaction.channel, ticket, interaction).catch(() => null);
+        ticket.status = 'deleted';
+        ticket.closedAt = new Date().toISOString();
+        await recordTicket(ticket);
         await interaction.editReply('Deleting this ticket...');
         return interaction.channel.delete();
       }
@@ -423,9 +458,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
         ticket.status = 'open';
         ticket.closedAt = null;
         saveStore();
-          await recordTicket(ticket);
+        await recordTicket(ticket);
         await interaction.channel.permissionOverwrites.edit(ticket.ownerId, { SendMessages: true, ViewChannel: true });
-        await interaction.channel.setName(`${ticketType(ticket).prefix}-${ticket.number}`).catch(() => null);
         await logEvent(interaction.guild, 'TICKET_REOPENED', ticket, `Reopened by ${interaction.user.tag}`);
         return interaction.editReply({ embeds: [new EmbedBuilder().setColor(colors.success).setTitle('Ticket reopened').setDescription(`Reopened by ${interaction.user}.`)], components: ticketButtons(ticket) });
       }
@@ -463,7 +497,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (!isStaff(interaction)) return interaction.reply({ content: 'Staff only.', ephemeral: true });
       ticket.status = 'open'; ticket.closedAt = null; saveStore();
       await interaction.channel.permissionOverwrites.edit(ticket.ownerId, { SendMessages: true, ViewChannel: true });
-      await interaction.channel.setName(`${ticketType(ticket).prefix}-${ticket.number}`).catch(() => null);
       await logEvent(interaction.guild, 'TICKET_REOPENED', ticket, `Reopened by ${interaction.user.tag}`);
       return interaction.reply({ embeds: [new EmbedBuilder().setColor(colors.success).setTitle('Ticket reopened').setDescription(`Reopened by ${interaction.user}.`)], components: ticketButtons(ticket) });
     }
@@ -477,7 +510,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (!isStaff(interaction)) return interaction.reply({ content: 'Staff only.', ephemeral: true });
       await interaction.deferReply({ ephemeral: true }); const filePath = await sendTranscript(interaction.channel, ticket, interaction); await logEvent(interaction.guild, 'TICKET_TRANSCRIPT_CREATED', ticket, `Generated by ${interaction.user.tag}`); return interaction.editReply({ content: 'Transcript generated.', files: [new AttachmentBuilder(filePath)] });
     }
-    if (name === 'ticket-rename') { if (!isStaff(interaction)) return interaction.reply({ content: 'Staff only.', ephemeral: true }); await interaction.channel.setName(interaction.options.getString('name').toLowerCase().replace(/[^a-z0-9-]/g, '-').slice(0, 90)); return interaction.reply('Ticket renamed.'); }
+    if (name === 'ticket-rename') { if (!isStaff(interaction)) return interaction.reply({ content: 'Staff only.', ephemeral: true }); const newName = interaction.options.getString('name'); ticket.channelName = ticketChannelName(newName, ticket.number); await interaction.channel.setName(ticket.channelName); await recordTicket(ticket); return interaction.reply(`Ticket renamed to \`${ticket.channelName}\`.`); }
     if (name === 'ticket-add' || name === 'ticket-remove') { if (!isStaff(interaction)) return interaction.reply({ content: 'Staff only.', ephemeral: true }); const user = interaction.options.getUser('user'); await interaction.channel.permissionOverwrites.edit(user.id, name === 'ticket-add' ? { ViewChannel: true, SendMessages: true, ReadMessageHistory: true } : { ViewChannel: false }); return interaction.reply(`${user} ${name === 'ticket-add' ? 'added to' : 'removed from'} this ticket.`); }
     if (name === 'ticket-delete') { if (!isStaff(interaction) && interaction.user.id !== ticket.ownerId) return interaction.reply({ content: 'Only the ticket owner or staff can delete this ticket.', ephemeral: true }); await interaction.deferReply(); await sendTranscript(interaction.channel, ticket, interaction).catch(() => null); delete store.tickets[ticket.id]; saveStore(); await logEvent(interaction.guild, 'TICKET_DELETED', ticket, `Deleted by ${interaction.user.tag}`); await interaction.editReply('Deleting this ticket...'); return interaction.channel.delete(); }
   } catch (error) {

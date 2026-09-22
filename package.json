@@ -22,7 +22,8 @@
     "discord.js": "^14.22.1",
     "dotenv": "^16.6.1",
     "express": "^5.2.1",
-    "mongoose": "^9.10.1"
+    "mongoose": "^9.10.1",
+    "@supabase/supabase-js": "^2.57.4"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^5.0.4",
