@@ -339,10 +339,6 @@ client.on(Events.MessageCreate, async (message) => {
 
 client.on(Events.InteractionCreate, async (interaction) => {
   try {
-    if (Date.now() - interaction.createdTimestamp > 2500 && !interaction.deferred && !interaction.replied) {
-      console.warn(`Ignoring stale interaction ${interaction.id} (${interaction.customId || interaction.commandName || 'unknown'}). Refresh the ticket panel and try again.`);
-      return;
-    }
     if (interaction.isStringSelectMenu() && interaction.customId === 'ticket:select') {
       const blacklist = store.blacklist[`${interaction.guildId}:${interaction.user.id}`];
       if (blacklist) return interaction.reply({ content: `You are blocked from opening tickets${blacklist.reason ? `: ${blacklist.reason}` : '.'}`, ephemeral: true });
