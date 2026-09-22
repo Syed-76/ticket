@@ -245,13 +245,16 @@ const commands = [
 ].map((command) => command.toJSON());
 
 async function registerCommands() {
-  if (!process.env.CLIENT_ID || !process.env.GUILD_ID) throw new Error('Set CLIENT_ID and GUILD_ID in .env');
-  if (!/^\d{17,20}$/.test(process.env.CLIENT_ID) || !/^\d{17,20}$/.test(process.env.GUILD_ID)) {
-    throw new Error('CLIENT_ID and GUILD_ID must be Discord Snowflake IDs. Replace the placeholders in .env.');
-  }
+  if (!process.env.CLIENT_ID || !/^\d{17,20}$/.test(process.env.CLIENT_ID)) throw new Error('CLIENT_ID must be a valid Discord application ID.');
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
-  await rest.put(Routes.applicationGuildCommands(process.env.CLIENT_ID, process.env.GUILD_ID), { body: commands });
-  console.log(`Registered ${commands.length} slash commands in guild ${process.env.GUILD_ID}.`);
+  const guildId = /^\d{17,20}$/.test(process.env.GUILD_ID || '') ? process.env.GUILD_ID : null;
+  if (guildId) {
+    await rest.put(Routes.applicationGuildCommands(process.env.CLIENT_ID, guildId), { body: commands });
+    console.log(`Registered ${commands.length} slash commands in test guild ${guildId}.`);
+    return;
+  }
+  await rest.put(Routes.applicationCommands(process.env.CLIENT_ID), { body: commands });
+  console.log(`Registered ${commands.length} global slash commands for ${client.guilds.cache.size} connected server(s).`);
 }
 
 function helpEmbed(guildId) {
@@ -314,12 +317,18 @@ async function closeTicket(interaction, ticket, reason) {
 }
 
 client.once(Events.ClientReady, async (readyClient) => {
+  console.log(`Logged in as ${readyClient.user.tag} in public mode with ${client.guilds.cache.size} connected server(s).`);
   try {
     await registerCommands();
-    console.log(`Logged in as ${readyClient.user.tag}`);
   } catch (error) {
     console.error('Could not register slash commands:', error.message);
   }
+});
+
+client.on(Events.GuildCreate, (guild) => {
+  guildConfig(guild.id);
+  saveStore();
+  console.log(`Joined ${guild.name} (${guild.id}); guild configuration initialized automatically.`);
 });
 
 client.on(Events.Error, (error) => {
