@@ -184,13 +184,13 @@ function ticketEmbed(ticket) {
       ...(ticket.reference ? [{ name: 'Reference', value: ticket.reference, inline: true }] : []),
     )
     .setTimestamp(new Date(ticket.createdAt))
-    .setFooter({ text: 'Support Center • Please keep all relevant details in this ticket.' });
+    .setFooter({ text: ticket.claimedBy ? `Support Center • Claimed by ${ticket.claimedByName || `<@${ticket.claimedBy}>`}` : 'Support Center • Unclaimed ticket' });
 }
 
 function ticketButtons(ticket) {
   return [new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId(ticket.status === 'open' ? 'ticket:close' : 'ticket:reopen').setLabel(ticket.status === 'open' ? '🔒 Close Ticket' : '🔓 Reopen Ticket').setStyle(ticket.status === 'open' ? ButtonStyle.Danger : ButtonStyle.Success),
-    new ButtonBuilder().setCustomId('ticket:claim').setLabel(ticket.claimedBy ? '📌 Unclaim Ticket' : '📌 Claim Ticket').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('ticket:claim').setLabel(ticket.claimedBy ? '📌 Unclaim Ticket' : '📌 Claim Ticket').setStyle(ticket.claimedBy ? ButtonStyle.Success : ButtonStyle.Primary),
     new ButtonBuilder().setCustomId('ticket:add-member').setLabel('👤 Add Member').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId('ticket:logs').setLabel('📊 View Logs').setStyle(ButtonStyle.Secondary),
   )];
@@ -360,7 +360,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (!department?.categoryId || !department.roleId) return interaction.reply({ content: 'This department is not configured yet. Please contact an administrator.', ephemeral: true });
       const modal = new ModalBuilder().setCustomId(`ticket:create-modal:${departmentId}`).setTitle(department.label);
       const subject = new TextInputBuilder().setCustomId('subject').setLabel('What is your main concern?').setPlaceholder('Example: Payment failed on my order').setStyle(TextInputStyle.Short).setMaxLength(80).setRequired(true);
-      const description = new TextInputBuilder().setCustomId('description').setLabel('Describe what happened').setPlaceholder('Include the timeline, impact, and what you already tried.').setStyle(TextInputStyle.Paragraph).setMinLength(20).setMaxLength(2000).setRequired(true);
+      const description = new TextInputBuilder().setCustomId('description').setLabel('Describe what happened (optional)').setPlaceholder('Include the timeline, impact, and what you already tried.').setStyle(TextInputStyle.Paragraph).setMaxLength(2000).setRequired(false);
       const reference = new TextInputBuilder().setCustomId('reference').setLabel('Provide evidence links (if any)').setPlaceholder('Screenshots, videos, logs, order IDs, or related links').setStyle(TextInputStyle.Short).setMaxLength(100).setRequired(false);
       return interaction.showModal(modal.addComponents(new ActionRowBuilder().addComponents(subject), new ActionRowBuilder().addComponents(description), new ActionRowBuilder().addComponents(reference)));
     }
@@ -377,7 +377,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (!department?.categoryId || !department.roleId) return interaction.reply({ content: 'Ticket setup is incomplete. Ask an administrator to configure the support department.', ephemeral: true });
       const modal = new ModalBuilder().setCustomId(`ticket:create-modal:${departmentId}`).setTitle('Open a support ticket');
       const subject = new TextInputBuilder().setCustomId('subject').setLabel('What is your main concern?').setPlaceholder('Example: Payment failed on my order').setStyle(TextInputStyle.Short).setMaxLength(80).setRequired(true);
-      const description = new TextInputBuilder().setCustomId('description').setLabel('Describe what happened').setPlaceholder('Include the timeline, impact, and what you already tried.').setStyle(TextInputStyle.Paragraph).setMaxLength(2000).setRequired(true);
+      const description = new TextInputBuilder().setCustomId('description').setLabel('Describe what happened (optional)').setPlaceholder('Include the timeline, impact, and what you already tried.').setStyle(TextInputStyle.Paragraph).setMaxLength(2000).setRequired(false);
       const reference = new TextInputBuilder().setCustomId('reference').setLabel('Provide evidence links (if any)').setPlaceholder('Screenshots, videos, logs, order IDs, or related links').setStyle(TextInputStyle.Short).setMaxLength(100).setRequired(false);
       return interaction.showModal(modal.addComponents(new ActionRowBuilder().addComponents(subject), new ActionRowBuilder().addComponents(description), new ActionRowBuilder().addComponents(reference)));
     }
@@ -397,7 +397,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         { id: interaction.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] },
         { id: department.roleId, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.ManageMessages] },
       ] });
-      const ticket = { id: ticketId, guildId: interaction.guildId, channelId: channel.id, ownerId: interaction.user.id, ownerUsername: interaction.user.username, number, channelName, departmentId, subject: interaction.fields.getTextInputValue('subject'), description: interaction.fields.getTextInputValue('description'), reference: interaction.fields.getTextInputValue('reference') || null, status: 'open', claimedBy: null, createdAt: new Date().toISOString() };
+      const ticket = { id: ticketId, guildId: interaction.guildId, channelId: channel.id, ownerId: interaction.user.id, ownerUsername: interaction.user.username, number, channelName, departmentId, subject: interaction.fields.getTextInputValue('subject'), description: interaction.fields.getTextInputValue('description') || 'No description provided.', reference: interaction.fields.getTextInputValue('reference') || null, status: 'open', claimedBy: null, claimedByName: null, createdAt: new Date().toISOString() };
       ticket.claimedBy = await nextOnlineStaff(interaction.guild, department.roleId);
       store.tickets[ticketId] = ticket;
       recordTicketAttempt(interaction.guildId, interaction.user.id);
@@ -430,12 +430,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       if (interaction.customId === 'ticket:claim') {
         if (!isStaff(interaction)) return interaction.reply({ content: 'Only support staff can claim tickets.', ephemeral: true });
-        await interaction.deferReply();
         ticket.claimedBy = ticket.claimedBy === interaction.user.id ? null : interaction.user.id;
+        ticket.claimedByName = ticket.claimedBy ? interaction.user.tag : null;
         saveStore();
+        await interaction.update({ embeds: [ticketEmbed(ticket)], components: ticketButtons(ticket) });
         await recordTicket(ticket);
         await logEvent(interaction.guild, ticket.claimedBy ? 'TICKET_CLAIMED' : 'TICKET_UNCLAIMED', ticket, ticket.claimedBy ? `Claimed by ${interaction.user.tag}` : `Unclaimed by ${interaction.user.tag}`, interaction.user.id);
-        return interaction.editReply({ content: ticket.claimedBy ? `Ticket claimed by ${interaction.user}.` : 'Ticket is now unclaimed.', components: ticketButtons(ticket) });
+        return;
       }
       if (interaction.customId === 'ticket:add-member') {
         if (!isStaff(interaction)) return interaction.reply({ content: 'Only support staff can add members.', ephemeral: true });
